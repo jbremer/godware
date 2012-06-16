@@ -1,0 +1,13 @@
+# nmake makefile for building the godware component
+# For description of targets and options, see Nmakefile in the root directory.
+
+!if "$(PIN_HOME)"==""
+PIN_HOME=..
+!endif
+
+# Define tools to be buit and tested
+COMMON_TOOLS=godware.dll
+
+# Include building and testing rules from the root Nmakefile.
+INCLUDE_SUB_RULES=1
+!INCLUDE $(PIN_HOME)\Nmakefile

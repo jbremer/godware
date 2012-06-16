@@ -129,15 +129,49 @@ static void enum_syscalls()
     }
 }
 
+unsigned long syscall_name_to_number(const char *name)
+{
+    for (unsigned long i = 0; i < MAX_SYSCALL; i++) {
+        if(g_syscall_names[i] != NULL &&
+                !strcmp(g_syscall_names[i] + 2, name + 2)) {
+            return i;
+        }
+    }
+    fprintf(stderr, "System Call %s not found!\n", name);
+    exit(0);
+}
+
+typedef struct _syscall_t {
+    const char *name;
+    union {
+        ADDRINT args[15];
+        struct {
+            ADDRINT arg0, arg1, arg2, arg3;
+            ADDRINT arg4, arg5, arg6, arg7;
+        };
+    };
+} syscall_t;
+
+int g_process_handle_count = 0;
+HANDLE g_process_handle[256] = {0};
+
+int g_thread_handle_count = 0;
+HANDLE g_thread_handle[256] = {0};
+
 void syscall_entry(THREADID thread_id, CONTEXT *ctx, SYSCALL_STANDARD std,
     void *v)
 {
     unsigned long syscall_number = PIN_GetSyscallNumber(ctx, std);
     if(syscall_number < MAX_SYSCALL) {
         const char *name = g_syscall_names[syscall_number];
-        printf("%d %s\n", thread_id, name);
+        printf("%d %d %s\n", thread_id, syscall_number, name);
 
-        if(name != NULL && !strcmp(name, "ZwCreateUserProcess")) {
+        syscall_t *sc = &((syscall_t *) v)[thread_id];
+        if(name != NULL && !strcmp(name + 2, "CreateUserProcess")) {
+            sc->name = name;
+            sc->arg0 = PIN_GetSyscallArgument(ctx, std, 0);
+            sc->arg1 = PIN_GetSyscallArgument(ctx, std, 1);
+
             RTL_USER_PROCESS_PARAMETERS *process_parameters =
                 (RTL_USER_PROCESS_PARAMETERS *) PIN_GetSyscallArgument(ctx,
                     std, 8);
@@ -145,6 +179,12 @@ void syscall_entry(THREADID thread_id, CONTEXT *ctx, SYSCALL_STANDARD std,
             printf("image_name: %S\ncommand_line: %S\n",
                 process_parameters->ImagePathName.Buffer,
                 process_parameters->CommandLine.Buffer);
+
+            static unsigned long nt_close = syscall_name_to_number("NtClose");
+
+            // replace the system call with a harmless one; NtClose(NULL)
+            PIN_SetSyscallNumber(ctx, std, nt_close);
+            PIN_SetSyscallArgument(ctx, std, 0, 0);
         }
     }
     else {
@@ -155,7 +195,19 @@ void syscall_entry(THREADID thread_id, CONTEXT *ctx, SYSCALL_STANDARD std,
 void syscall_exit(THREADID thread_id, CONTEXT *ctx, SYSCALL_STANDARD std,
     void *v)
 {
-    unsigned long return_value = PIN_GetSyscallReturn(ctx, std);
+    //unsigned long return_value = PIN_GetSyscallReturn(ctx, std);
+    syscall_t *sc = &((syscall_t *) v)[thread_id];
+    if(sc->name != NULL) {
+        if(!strcmp(sc->name + 2, "CreateUserProcess")) {
+            // fill the process and thread handles with some garbage
+            *(HANDLE *) sc->arg0 = W::CreateMutex(NULL, FALSE, NULL);
+            *(HANDLE *) sc->arg1 = W::CreateMutex(NULL, FALSE, NULL);
+
+            g_process_handle[g_process_handle_count++] = (HANDLE) sc->arg0;
+            g_thread_handle[g_thread_handle_count++] = (HANDLE) sc->arg1;
+        }
+        sc->name = NULL;
+    }
 }
 
 int main(int argc, char *argv[])
@@ -167,8 +219,9 @@ int main(int argc, char *argv[])
 
     enum_syscalls();
 
-    PIN_AddSyscallEntryFunction(&syscall_entry, 0);
-    PIN_AddSyscallExitFunction(&syscall_exit, 0);
+    static syscall_t sc[256] = {0};
+    PIN_AddSyscallEntryFunction(&syscall_entry, &sc);
+    PIN_AddSyscallExitFunction(&syscall_exit, &sc);
 
     PIN_StartProgram();
     return 0;

@@ -6,6 +6,7 @@ typedef LONG (WINAPI *LP_NtUnmapViewOfSection)(HANDLE ProcessHandle,
 
 char *FileToMem(const char *pszFileName)
 {
+    char *lpBuffer = NULL;
     HANDLE hFile = CreateFile(pszFileName, GENERIC_READ, FILE_SHARE_READ,
         NULL, OPEN_EXISTING, 0, NULL);
     if(hFile == INVALID_HANDLE_VALUE) goto cleanup;
@@ -13,7 +14,7 @@ char *FileToMem(const char *pszFileName)
     DWORD dwSize = GetFileSize(hFile, NULL);
     if(dwSize == (DWORD) -1) goto cleanup;
 
-    char *lpBuffer = VirtualAlloc(NULL, dwSize, MEM_COMMIT | MEM_RESERVE,
+    lpBuffer = VirtualAlloc(NULL, dwSize, MEM_COMMIT | MEM_RESERVE,
         PAGE_READWRITE);
     if(lpBuffer == NULL) goto cleanup;
 
@@ -39,7 +40,7 @@ cleanup:
 
 int ExecFile(const char *pszFilePath, char *lpFile)
 {
-    DWORD dwBytes;
+    DWORD dwBytes; void *lpImageBase = NULL;
 
     // check the image dos header
     IMAGE_DOS_HEADER *pImageDosHeader = (IMAGE_DOS_HEADER *) lpFile;
@@ -70,9 +71,7 @@ int ExecFile(const char *pszFilePath, char *lpFile)
             ReadProcessMemory(ProcessInformation.hProcess,
                 (void *)(ctx.Ebx + 8), &dwImageBase, 4, &dwBytes) == FALSE ||
             dwBytes != 4) {
-        CloseHandle(ProcessInformation.hThread);
-        CloseHandle(ProcessInformation.hProcess);
-        return FALSE;
+        goto cleanup;
     }
 
     // unmap the loaded binary if the base address conflicts
@@ -85,14 +84,12 @@ int ExecFile(const char *pszFilePath, char *lpFile)
     }
 
     // allocate memory in the remote process for our binary
-    void *lpImageBase = VirtualAllocEx(ProcessInformation.hProcess,
+    lpImageBase = VirtualAllocEx(ProcessInformation.hProcess,
         (void *) pImageNtHeaders->OptionalHeader.ImageBase,
         pImageNtHeaders->OptionalHeader.SizeOfImage, MEM_COMMIT | MEM_RESERVE,
         PAGE_EXECUTE_READWRITE);
     if(lpImageBase == NULL) {
-        CloseHandle(ProcessInformation.hThread);
-        CloseHandle(ProcessInformation.hProcess);
-        return FALSE;
+        goto cleanup;
     }
 
     // write the headers of our binary to the process
@@ -100,11 +97,7 @@ int ExecFile(const char *pszFilePath, char *lpFile)
             pImageNtHeaders->OptionalHeader.SizeOfHeaders, &dwBytes)
                 == FALSE ||
             dwBytes != pImageNtHeaders->OptionalHeader.SizeOfHeaders) {
-        VirtualFreeEx(ProcessInformation.hProcess, lpImageBase, 0,
-            MEM_RELEASE);
-        CloseHandle(ProcessInformation.hThread);
-        CloseHandle(ProcessInformation.hProcess);
-        return FALSE;
+        goto cleanup;
     }
 
     // enumerate all the sections in this binary
@@ -124,22 +117,14 @@ int ExecFile(const char *pszFilePath, char *lpFile)
                 lpFile + pImageSectionHeader->PointerToRawData,
                 pImageSectionHeader->SizeOfRawData, &dwBytes) == FALSE ||
                 pImageSectionHeader->SizeOfRawData != dwBytes) {
-            VirtualFreeEx(ProcessInformation.hProcess, lpImageBase, 0,
-                MEM_RELEASE);
-            CloseHandle(ProcessInformation.hThread);
-            CloseHandle(ProcessInformation.hProcess);
-            return FALSE;
+            goto cleanup;
         }
     }
 
     // write the new image base address
     if(WriteProcessMemory(ProcessInformation.hProcess, (void *)(ctx.Ebx + 8),
             &lpImageBase, 4, &dwBytes) == FALSE || dwBytes != 4) {
-        VirtualFreeEx(ProcessInformation.hProcess, lpImageBase, 0,
-            MEM_RELEASE);
-        CloseHandle(ProcessInformation.hThread);
-        CloseHandle(ProcessInformation.hProcess);
-        return FALSE;
+        goto cleanup;
     }
 
     // store the new entry point
@@ -156,6 +141,16 @@ int ExecFile(const char *pszFilePath, char *lpFile)
     CloseHandle(ProcessInformation.hThread);
     CloseHandle(ProcessInformation.hProcess);
     return TRUE;
+
+cleanup:
+    // clean up our resources
+    if(lpImageBase != NULL) {
+        VirtualFreeEx(ProcessInformation.hProcess, lpImageBase, 0,
+            MEM_RELEASE);
+    }
+    CloseHandle(ProcessInformation.hThread);
+    CloseHandle(ProcessInformation.hProcess);
+    return FALSE;
 }
 
 int main(int argc, char *argv[])

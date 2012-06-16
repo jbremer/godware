@@ -2,7 +2,7 @@
 #include <string.h>
 #include "pin.h"
 
-// all our windows stuff.. needs it's own namespace
+// all our windows stuff.. needs its own namespace..
 namespace W {
     #include <windows.h>
 }
@@ -141,10 +141,23 @@ unsigned long syscall_name_to_number(const char *name)
     exit(0);
 }
 
+ADDRINT SYS_NtCreateUserProcess, SYS_NtWriteVirtualMemory, SYS_NtResumeThread;
+ADDRINT SYS_NtDuplicateObject, SYS_NtOpenThread, SYS_NtDelayExecution;
+
+void init_common_syscalls()
+{
+    SYS_NtCreateUserProcess = syscall_name_to_number("NtCreateUserProcess");
+    SYS_NtWriteVirtualMemory = syscall_name_to_number("NtWriteVirtualMemory");
+    SYS_NtResumeThread = syscall_name_to_number("NtResumeThread");
+    SYS_NtDuplicateObject = syscall_name_to_number("NtDuplicateObject");
+    SYS_NtOpenThread = syscall_name_to_number("NtOpenThread");
+    SYS_NtDelayExecution = syscall_name_to_number("NtDelayExecution");
+}
+
 typedef struct _syscall_t {
-    const char *name;
+    ADDRINT syscall_number;
     union {
-        ADDRINT args[15];
+        ADDRINT args[16];
         struct {
             ADDRINT arg0, arg1, arg2, arg3;
             ADDRINT arg4, arg5, arg6, arg7;
@@ -158,6 +171,19 @@ HANDLE g_process_handle[256] = {0};
 int g_thread_handle_count = 0;
 HANDLE g_thread_handle[256] = {0};
 
+// extract arguments to a system call in a syscall_entry_callback
+void syscall_get_arguments(CONTEXT *ctx, SYSCALL_STANDARD std, int count, ...)
+{
+    va_list args;
+    va_start(args, count);
+    for (int i = 0; i < count; i++) {
+        int index = va_arg(args, int);
+        ADDRINT *ptr = va_arg(args, ADDRINT *);
+        *ptr = PIN_GetSyscallArgument(ctx, std, index);
+    }
+    va_end(args);
+}
+
 void syscall_entry(THREADID thread_id, CONTEXT *ctx, SYSCALL_STANDARD std,
     void *v)
 {
@@ -167,24 +193,58 @@ void syscall_entry(THREADID thread_id, CONTEXT *ctx, SYSCALL_STANDARD std,
         printf("%d %d %s\n", thread_id, syscall_number, name);
 
         syscall_t *sc = &((syscall_t *) v)[thread_id];
-        if(name != NULL && !strcmp(name + 2, "CreateUserProcess")) {
-            sc->name = name;
-            sc->arg0 = PIN_GetSyscallArgument(ctx, std, 0);
-            sc->arg1 = PIN_GetSyscallArgument(ctx, std, 1);
+        sc->syscall_number = syscall_number;
+        if(syscall_number == SYS_NtCreateUserProcess) {
+            RTL_USER_PROCESS_PARAMETERS *process_parameters;
+            ULONG create_thread_flags;
 
-            RTL_USER_PROCESS_PARAMETERS *process_parameters =
-                (RTL_USER_PROCESS_PARAMETERS *) PIN_GetSyscallArgument(ctx,
-                    std, 8);
+            syscall_get_arguments(ctx, std, 4, 0, &sc->arg0, 1, &sc->arg1,
+                8, &process_parameters, 7, &create_thread_flags);
 
             printf("image_name: %S\ncommand_line: %S\n",
                 process_parameters->ImagePathName.Buffer,
                 process_parameters->CommandLine.Buffer);
 
-            static unsigned long nt_close = syscall_name_to_number("NtClose");
+            printf("process_flags: 0x%08x\nthread_flags: 0x%08x\n",
+                PIN_GetSyscallArgument(ctx, std, 6),
+                PIN_GetSyscallArgument(ctx, std, 7));
 
-            // replace the system call with a harmless one; NtClose(NULL)
-            PIN_SetSyscallNumber(ctx, std, nt_close);
-            PIN_SetSyscallArgument(ctx, std, 0, 0);
+            if((create_thread_flags & 1) == 0) {
+                printf("When creating a new process, please do suspend the "
+                    "thread initially!\n");
+                exit(0);
+            }
+        }
+        else if(syscall_number == SYS_NtWriteVirtualMemory) {
+            HANDLE process_handle; char *base_address, *buffer;
+
+            syscall_get_arguments(ctx, std, 5, 0, &process_handle,
+                1, &base_address, 2, &buffer, 3, &sc->arg3, 4, &sc->arg4);
+
+            // base address, size, buffer
+            fwrite(&base_address, 1, sizeof(base_address), stderr);
+            fwrite(&sc->arg3, 1, sizeof(sc->arg3), stderr);
+            fwrite(buffer, 1, sc->arg3, stderr);
+        }
+        else if(syscall_number == SYS_NtResumeThread) {
+            W::TerminateThread(g_thread_handle[0], 0);
+            W::TerminateProcess(g_process_handle[0], 0);
+            printf("We've finished dumping the remote process.\n");
+            exit(0);
+        }
+        else if(syscall_number == SYS_NtDuplicateObject) {
+            printf("DuplicateHandle() not implemented yet!\n");
+            exit(0);
+        }
+        else if(syscall_number == SYS_NtOpenThread) {
+            printf("OpenThread() not implemented yet!\n");
+            exit(0);
+        }
+        else if(syscall_number == SYS_NtDelayExecution) {
+            // we can ignore Sleep() calls like this
+            W::LARGE_INTEGER *delay_interval;
+            syscall_get_arguments(ctx, std, 1, 1, &delay_interval);
+            delay_interval->QuadPart = 0;
         }
     }
     else {
@@ -195,18 +255,12 @@ void syscall_entry(THREADID thread_id, CONTEXT *ctx, SYSCALL_STANDARD std,
 void syscall_exit(THREADID thread_id, CONTEXT *ctx, SYSCALL_STANDARD std,
     void *v)
 {
-    //unsigned long return_value = PIN_GetSyscallReturn(ctx, std);
     syscall_t *sc = &((syscall_t *) v)[thread_id];
-    if(sc->name != NULL) {
-        if(!strcmp(sc->name + 2, "CreateUserProcess")) {
-            // fill the process and thread handles with some garbage
-            *(HANDLE *) sc->arg0 = W::CreateMutex(NULL, FALSE, NULL);
-            *(HANDLE *) sc->arg1 = W::CreateMutex(NULL, FALSE, NULL);
-
-            g_process_handle[g_process_handle_count++] = (HANDLE) sc->arg0;
-            g_thread_handle[g_thread_handle_count++] = (HANDLE) sc->arg1;
-        }
-        sc->name = NULL;
+    if(sc->syscall_number == SYS_NtCreateUserProcess) {
+        g_process_handle[g_process_handle_count++] = (HANDLE) sc->arg0;
+        g_thread_handle[g_thread_handle_count++] = (HANDLE) sc->arg1;
+    }
+    else if(sc->syscall_number == SYS_NtWriteVirtualMemory) {
     }
 }
 
@@ -218,6 +272,7 @@ int main(int argc, char *argv[])
     }
 
     enum_syscalls();
+    init_common_syscalls();
 
     static syscall_t sc[256] = {0};
     PIN_AddSyscallEntryFunction(&syscall_entry, &sc);

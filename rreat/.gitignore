@@ -1,8 +1,0 @@
-ipch
-Debug
-Release
-*.opensdf
-*.sdf
-*.suo
-*.o
-*.exe

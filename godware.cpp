@@ -119,7 +119,9 @@ static void enum_syscalls()
             // does the signature match?
             // either:   mov eax, syscall_number ; mov ecx, some_value
             // or:       mov eax, syscall_number ; xor ecx, ecx
-            if(*addr == 0xb8 && (addr[5] == 0xb9 || addr[5] == 0x33)) {
+            // or:       mov eax, syscall_number ; mov edx, 0x7ffe0300
+            if(*addr == 0xb8 &&
+                    (addr[5] == 0xb9 || addr[5] == 0x33 || addr[5] == 0xba)) {
                 unsigned long syscall_number = *(unsigned long *)(addr + 1);
                 if(syscall_number < MAX_SYSCALL) {
                     g_syscall_names[syscall_number] = name;
@@ -137,21 +139,26 @@ unsigned long syscall_name_to_number(const char *name)
             return i;
         }
     }
-    fprintf(stderr, "System Call %s not found!\n", name);
-    exit(0);
+    printf("System Call %s not found!\n", name);
+    return 0;
 }
 
 ADDRINT SYS_NtCreateUserProcess, SYS_NtWriteVirtualMemory, SYS_NtResumeThread;
 ADDRINT SYS_NtDuplicateObject, SYS_NtOpenThread, SYS_NtDelayExecution;
+ADDRINT SYS_NtOpenProcess, SYS_NtCreateProcess, SYS_NtCreateProcessEx;
 
 void init_common_syscalls()
 {
     SYS_NtCreateUserProcess = syscall_name_to_number("NtCreateUserProcess");
+    SYS_NtCreateProcess = syscall_name_to_number("NtCreateProcess");
+    SYS_NtCreateProcessEx = syscall_name_to_number("NtCreateProcessEx");
+
     SYS_NtWriteVirtualMemory = syscall_name_to_number("NtWriteVirtualMemory");
     SYS_NtResumeThread = syscall_name_to_number("NtResumeThread");
     SYS_NtDuplicateObject = syscall_name_to_number("NtDuplicateObject");
     SYS_NtOpenThread = syscall_name_to_number("NtOpenThread");
     SYS_NtDelayExecution = syscall_name_to_number("NtDelayExecution");
+    SYS_NtOpenProcess = syscall_name_to_number("NtOpenProcess");
 }
 
 typedef struct _syscall_t {
@@ -170,6 +177,9 @@ HANDLE g_process_handle[256] = {0};
 
 int g_thread_handle_count = 0;
 HANDLE g_thread_handle[256] = {0};
+
+PIN_LOCK g_write_lock;
+FILE *g_file;
 
 // extract arguments to a system call in a syscall_entry_callback
 void syscall_get_arguments(CONTEXT *ctx, SYSCALL_STANDARD std, int count, ...)
@@ -215,16 +225,36 @@ void syscall_entry(THREADID thread_id, CONTEXT *ctx, SYSCALL_STANDARD std,
                 exit(0);
             }
         }
+        else if(syscall_number == SYS_NtCreateProcess ||
+                syscall_number == SYS_NtCreateProcessEx) {
+            OBJECT_ATTRIBUTES *object_attributes;
+            syscall_get_arguments(ctx, std, 2, 0, &sc->arg0,
+                2, &object_attributes);
+
+            if(object_attributes != NULL &&
+                    object_attributes->ObjectName != NULL) {
+                printf("image_name: %S\n",
+                    object_attributes->ObjectName->Buffer);
+            }
+        }
         else if(syscall_number == SYS_NtWriteVirtualMemory) {
             HANDLE process_handle; char *base_address, *buffer;
 
             syscall_get_arguments(ctx, std, 5, 0, &process_handle,
                 1, &base_address, 2, &buffer, 3, &sc->arg3, 4, &sc->arg4);
 
+            GetLock(&g_write_lock, thread_id+1);
+
             // base address, size, buffer
-            fwrite(&base_address, 1, sizeof(base_address), stderr);
-            fwrite(&sc->arg3, 1, sizeof(sc->arg3), stderr);
-            fwrite(buffer, 1, sc->arg3, stderr);
+            fwrite(&base_address, 1, sizeof(base_address), g_file);
+            fwrite(&sc->arg3, 1, sizeof(sc->arg3), g_file);
+            fwrite(buffer, 1, sc->arg3, g_file);
+            fflush(g_file);
+
+            printf("Writing 0x%08x bytes to 0x%08x\n", sc->arg3,
+                base_address);
+
+            ReleaseLock(&g_write_lock);
         }
         else if(syscall_number == SYS_NtResumeThread) {
             W::TerminateThread(g_thread_handle[0], 0);
@@ -234,16 +264,24 @@ void syscall_entry(THREADID thread_id, CONTEXT *ctx, SYSCALL_STANDARD std,
         }
         else if(syscall_number == SYS_NtDuplicateObject) {
             printf("DuplicateHandle() not implemented yet!\n");
-            exit(0);
+            //exit(0);
         }
         else if(syscall_number == SYS_NtOpenThread) {
             printf("OpenThread() not implemented yet!\n");
-            exit(0);
+            //exit(0);
+        }
+        else if(syscall_number == SYS_NtOpenProcess) {
+            printf("OpenProcess() not implemented yet!\n");
+            //exit(0);
         }
         else if(syscall_number == SYS_NtDelayExecution) {
             // we can ignore Sleep() calls like this
             W::LARGE_INTEGER *delay_interval;
             syscall_get_arguments(ctx, std, 1, 1, &delay_interval);
+            if(delay_interval->QuadPart != 0) {
+                printf("Skipped Sleep(%d)\n",
+                    -delay_interval->QuadPart / 10000);
+            }
             delay_interval->QuadPart = 0;
         }
     }
@@ -257,10 +295,12 @@ void syscall_exit(THREADID thread_id, CONTEXT *ctx, SYSCALL_STANDARD std,
 {
     syscall_t *sc = &((syscall_t *) v)[thread_id];
     if(sc->syscall_number == SYS_NtCreateUserProcess) {
-        g_process_handle[g_process_handle_count++] = (HANDLE) sc->arg0;
-        g_thread_handle[g_thread_handle_count++] = (HANDLE) sc->arg1;
+        g_process_handle[g_process_handle_count++] = *(HANDLE *) sc->arg0;
+        g_thread_handle[g_thread_handle_count++] = *(HANDLE *) sc->arg1;
     }
-    else if(sc->syscall_number == SYS_NtWriteVirtualMemory) {
+    else if(sc->syscall_number == SYS_NtCreateProcess ||
+            sc->syscall_number == SYS_NtCreateProcessEx) {
+        g_process_handle[g_process_handle_count++] = *(HANDLE *) sc->arg0;
     }
 }
 
@@ -270,6 +310,10 @@ int main(int argc, char *argv[])
         printf("Usage: %s <binary> [arguments]\n");
         return 0;
     }
+
+    g_file = fopen("logz.txt", "wb");
+
+    InitLock(&g_write_lock);
 
     enum_syscalls();
     init_common_syscalls();

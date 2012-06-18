@@ -1,4 +1,5 @@
 godware
 =======
 
-Short for Good Ware; it assists Reverse Engineers to analyze Windows Malware.
+Short for Good Ware; it assists Reverse Engineers in the analysis of Windows
+Malware.
